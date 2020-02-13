@@ -24,45 +24,72 @@ class Normal(object):
 
 
 class Encoder(torch.nn.Module):
-    def __init__(self, D_in, H, D_out):
+    """
+    Encoder for the variational autoencoder, encodes from the input space to the latent space.
+    Forward pass takes an image vector and returns a tuple (mu, log(sigma)).
+    """
+
+    def __init__(self, input_size, hidden1_size, hidden2_size, latent_size):
         super(Encoder, self).__init__()
-        self.linear1 = torch.nn.Linear(D_in, H)
-        self.linear2 = torch.nn.Linear(H, D_out)
+
+        self.input_size = input_size
+        self.hidden1_size = hidden1_size
+        self.hidden2_size = hidden2_size
+        self.latent_size = latent_size
+
+        self._hidden1 = torch.nn.Linear(input_size, hidden1_size)
+        self._hidden2 = torch.nn.Linear(hidden1_size, hidden2_size)
+        self._latnet_mu = torch.nn.Linear(hidden2_size, latent_size)
+        self._latent_sigma = torch.nn.Linear(hidden2_size, latent_size)
 
     def forward(self, x):
-        x = F.relu(self.linear1(x))
-        return F.relu(self.linear2(x))
+        h1 = F.relu(self._hidden1(x))
+        h2 = F.relu(self._hidden2(h1))
+        return self._latnet_mu(h2), self._latent_sigma(h2)
 
 
 class Decoder(torch.nn.Module):
-    def __init__(self, D_in, H, D_out):
+    """
+    Decoder for the variational autoencoder, decodes from the latent space to the output space.
+    Forward pass takes a latent space vector and returns an image  vector.
+    """
+
+    def __init__(self, latent_size, hidden_size, output_size):
         super(Decoder, self).__init__()
-        self.linear1 = torch.nn.Linear(D_in, H)
-        self.linear2 = torch.nn.Linear(H, D_out)
+
+        self.latent_size = latent_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+
+        self.hidden_layer = torch.nn.Linear(latent_size, hidden_size)
+        self.output_layer = torch.nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
-        x = F.relu(self.linear1(x))
-        return F.relu(self.linear2(x))
+        x = F.relu(self.hidden_layer(x))
+        return F.relu(self.output_layer(x))
 
 
-class VAE(torch.nn.Module):
-    latent_dim = 8
+class Vae(torch.nn.Module):
 
     def __init__(self, encoder, decoder):
-        super(VAE, self).__init__()
+        super(Vae, self).__init__()
+
+        # Save dependencies.
         self.encoder = encoder
         self.decoder = decoder
-        self._enc_mu = torch.nn.Linear(100, 8)
-        self._enc_log_sigma = torch.nn.Linear(100, 8)
 
-    def _sample_latent(self, h_enc):
+        # Make sure encoder and decoder are compatible.
+        assert encoder.latent_size == decoder.latent_size
+
+        # self.sample_from_normal_dist = torch.from_numpy(np.random.normal(0, 1, size=encoder.latent_size.size())).float()
+
+    def _sample_latent(self, mu, log_sigma):
         """
-        Return the latent normal sample z ~ N(mu, sigma^2)
+        Return a sample from the latent vector with normal distribution of z ~ N(mu, sigma^2)
         """
-        mu = self._enc_mu(h_enc)
-        log_sigma = self._enc_log_sigma(h_enc)
         sigma = torch.exp(log_sigma)
-        std_z = torch.from_numpy(np.random.normal(0, 1, size=sigma.size())).float()
+        std_z = torch.randn(sigma.size(), device=sigma.device)
+        # std_z = torch.from_numpy(np.random.normal(0, 1, size=sigma.size())).float()
 
         self.z_mean = mu
         self.z_sigma = sigma
@@ -70,8 +97,8 @@ class VAE(torch.nn.Module):
         return mu + sigma * Variable(std_z, requires_grad=False)  # Reparameterization trick
 
     def forward(self, state):
-        h_enc = self.encoder(state)
-        z = self._sample_latent(h_enc)
+        mu, log_sigma = self.encoder(state)
+        z = self._sample_latent(mu, log_sigma)
         return self.decoder(z)
 
 
@@ -83,38 +110,64 @@ def latent_loss(z_mean, z_stddev):
 
 if __name__ == '__main__':
 
-    input_dim = 28 * 28
+    image_dim = 28 * 28
+    hidden_dim = 100
+    latent_dim = 8
     batch_size = 32
+    seed = 1
 
-    transform = transforms.Compose(
-        [transforms.ToTensor()])
-    mnist = torchvision.datasets.MNIST('./', download=True, transform=transform)
+    # Use GPU?
+    use_cuda = torch.cuda.is_available()
+
+    # Seed random number generators.
+    torch.manual_seed(seed)
+    if use_cuda:
+        torch.cuda.manual_seed(seed)
+
+    device = torch.device('cuda' if use_cuda else 'cpu')
+
+    # Use MNIST dataset.
+    mnist = torchvision.datasets.MNIST('./', transform=transforms.ToTensor(), download=True)
 
     dataloader = torch.utils.data.DataLoader(mnist, batch_size=batch_size,
                                              shuffle=True, num_workers=2)
 
-    print('Number of samples: ', len(mnist))
+    print(f'Number of samples: {len(mnist)}')
 
-    encoder = Encoder(input_dim, 100, 100)
-    decoder = Decoder(8, 100, input_dim)
-    vae = VAE(encoder, decoder)
+    # Define the network structure.
+    encoder = Encoder(image_dim, hidden_dim, hidden_dim, latent_dim).to(device)
+    decoder = Decoder(latent_dim, hidden_dim, image_dim).to(device)
+    vae = Vae(encoder, decoder).to(device)
 
-    criterion = nn.MSELoss()
+    # Use mean L2 norm as loss for the output of the autoencoder.
+    generator_loss = nn.MSELoss()
 
     optimizer = optim.Adam(vae.parameters(), lr=0.0001)
-    l = None
+    loss = None
     for epoch in range(100):
         for i, data in enumerate(dataloader, 0):
-            inputs, classes = data
-            inputs, classes = Variable(inputs.resize_(batch_size, input_dim)), Variable(classes)
-            optimizer.zero_grad()
-            dec = vae(inputs)
-            ll = latent_loss(vae.z_mean, vae.z_sigma)
-            loss = criterion(dec, inputs) + ll
-            loss.backward()
-            optimizer.step()
-            l = loss.data[0]
-        print(epoch, l)
+            input_images, image_classes = data
 
-    plt.imshow(vae(inputs).data[0].numpy().reshape(28, 28), cmap='gray')
+            image_classes = image_classes.to(device)
+            input_images = input_images.resize_(batch_size, image_dim).to(device)
+
+            # Reset gradients to zero
+            optimizer.zero_grad()
+
+            # Forward pass
+            output_images = vae(input_images)
+
+            # Calculate loss
+            ll = latent_loss(vae.z_mean, vae.z_sigma)
+            loss = generator_loss(output_images, input_images) + ll
+
+            # Calculate gradients
+            loss.backward()
+
+            # Update weights
+            optimizer.step()
+
+        print(epoch, loss.data.cpu().numpy())
+
+    plt.imshow(vae(input_images).data[0].numpy().reshape(28, 28), cmap='gray')
     plt.show(block=True)
